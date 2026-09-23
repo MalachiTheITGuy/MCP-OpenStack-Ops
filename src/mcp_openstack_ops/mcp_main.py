@@ -213,7 +213,15 @@ def _get_resource_status_by_name(resource_type: str, resource_name: str) -> str:
                     if keypair.get('name') == resource_name.strip():
                         return 'Available'  # Keypairs don't have status, just exist or not
             return 'Not Found'
-            
+
+        elif resource_type == "router":
+            routers = _get_routers()
+            if isinstance(routers, list):
+                for router in routers:
+                    if router.get('name') == resource_name.strip():
+                        return 'Available'  # Routers don't have status, just exist or not
+            return 'Not Found'
+
         else:
             return 'Unknown Resource Type'
             

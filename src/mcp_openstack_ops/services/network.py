@@ -1102,6 +1102,97 @@ def get_routers() -> List[Dict[str, Any]]:
         ]
 
 
+def set_routers(action: str, router_name: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+    """
+    Manage OpenStack routers.
+
+    Args:
+        action: Action to perform (list, show, create, set, delete, add_interface, remove_interface)
+        router_name: Name or ID of router (for specific operations)
+        **kwargs: Additional parameters
+
+    Returns:
+        Result of the router operation
+    """
+    try:
+        from ..connection import get_openstack_connection
+        conn = get_openstack_connection()
+
+        if action.lower() == 'list':
+            return {'success': True, 'routers': get_routers(), 'message': f'Retrieved {len(get_routers())} routers'}
+
+        if action.lower() == 'show':
+            routers = get_routers()
+            for router in routers:
+                if router['name'] == router_name or router['id'] == router_name:
+                    return {'success': True, 'router': router, 'message': f'Found router {router_name}'}
+            return {'success': False, 'message': f'Router {router_name} not found'}
+
+        if action.lower() == 'create':
+            create_params = {}
+            create_params['name'] = kwargs.get('name', router_name)
+            create_params['admin_state_up'] = kwargs.get('admin_state_up', True)
+            if 'description' in kwargs:
+                create_params['description'] = kwargs['description']
+            if 'ha' in kwargs:
+                create_params['ha'] = kwargs['ha']
+            if 'distributed' in kwargs:
+                create_params['distributed'] = kwargs['distributed']
+            external_network_id = kwargs.get('external_network_id')
+            if external_network_id:
+                create_params['external_gateway_info'] = {'network_id': external_network_id, 'enable_snat': True}
+                if 'gateway_ip' in kwargs:
+                    create_params['external_gateway_info']['external_fixed_ips'] = [{'subnet_id': kwargs.get('subnet_id', ''), 'ip_address': kwargs['gateway_ip']}]
+            router = conn.network.create_router(**create_params)
+            return {'success': True, 'router': {'id': router.id, 'name': router.name, 'status': router.status}, 'message': f'Router {router.name} created'}
+
+        if action.lower() == 'set':
+            router = find_resource_by_name_or_id(conn.network.routers(), router_name, "Router")
+            update_params = {}
+            if 'name' in kwargs:
+                update_params['name'] = kwargs['name']
+            if 'description' in kwargs:
+                update_params['description'] = kwargs['description']
+            if 'admin_state_up' in kwargs:
+                update_params['admin_state_up'] = kwargs['admin_state_up']
+            if 'ha' in kwargs:
+                update_params['ha'] = kwargs['ha']
+            if 'distributed' in kwargs:
+                update_params['distributed'] = kwargs['distributed']
+            if 'external_network_id' in kwargs:
+                update_params['external_gateway_info'] = {'network_id': kwargs['external_network_id'], 'enable_snat': True}
+                if 'gateway_ip' in kwargs:
+                    update_params['external_gateway_info']['external_fixed_ips'] = [{'subnet_id': kwargs.get('subnet_id', ''), 'ip_address': kwargs['gateway_ip']}]
+            router = conn.network.update_router(router, **update_params)
+            return {'success': True, 'router': {'id': router.id, 'name': router.name, 'status': router.status}, 'message': f'Router {router_name} updated'}
+
+        if action.lower() == 'delete':
+            router = find_resource_by_name_or_id(conn.network.routers(), router_name, "Router")
+            conn.network.delete_router(router)
+            return {'success': True, 'message': f'Router {router_name} deleted'}
+
+        if action.lower() == 'add_interface':
+            router = find_resource_by_name_or_id(conn.network.routers(), router_name, "Router")
+            subnet_id = kwargs.get('subnet_id')
+            if not subnet_id:
+                return {'success': False, 'message': 'subnet_id is required for add_interface'}
+            interface = conn.network.add_interface_to_router(router, subnet_id=subnet_id)
+            return {'success': True, 'interface': {'id': interface.id, 'device_id': interface.device_id}, 'message': f'Interface added to router {router_name}'}
+
+        if action.lower() == 'remove_interface':
+            router = find_resource_by_name_or_id(conn.network.routers(), router_name, "Router")
+            subnet_id = kwargs.get('subnet_id')
+            if not subnet_id:
+                return {'success': False, 'message': 'subnet_id is required for remove_interface'}
+            conn.network.remove_interface_from_router(router, subnet_id=subnet_id)
+            return {'success': True, 'message': f'Interface removed from router {router_name}'}
+
+        return {'success': False, 'message': f'Unknown action: {action}'}
+    except Exception as e:
+        logger.error(f"Failed to set routers: {e}")
+        return {'success': False, 'message': str(e)}
+
+
 def set_network_ports(action: str, port_name: Optional[str] = None, **kwargs) -> Dict[str, Any]:
     """
     Manage network ports.
