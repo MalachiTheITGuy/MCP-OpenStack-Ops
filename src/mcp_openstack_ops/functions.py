@@ -930,6 +930,7 @@ from .services.network import (
     set_floating_ip,
     set_floating_ip_port_forwarding,
     get_routers,
+    set_routers,
     set_networks,
     set_network_ports,
     set_subnets
