@@ -24,9 +24,13 @@ async def set_routers(
     ha: bool = False,
     distributed: bool = False,
     external_network_id: str = "",
-    mtu: int = 1442,
+    # Neutron routers have no MTU field (it belongs to the network). Kept only
+    # so a caller passing it gets an explanatory rejection, not a silent no-op.
+    mtu: int = 0,
     gateway_ip: str = "",
     subnet_id: str = "",
+    enable_snat: bool = True,
+    routes: str = "",
 ) -> str:
     """
     Manage OpenStack routers for network routing.
@@ -56,7 +60,9 @@ async def set_routers(
     2. Filter-based: Use name_contains to auto-identify targets
 
     Args:
-        action: Action to perform - create, delete, update, set, show, list
+        action: Action to perform - create, delete, update, set, show, list,
+                add_interface, remove_interface, add_gateway, remove_gateway,
+                add_routes, remove_routes
         router_names: Name(s) of routers to manage. Support formats:
                       - Single: "router1"
                       - Multiple: "router1,router2,router3"
@@ -72,7 +78,8 @@ async def set_routers(
         ha: Enable high availability (default: False)
         distributed: Enable distributed routing (default: False)
         external_network_id: External network ID for gateway attachment
-        mtu: Explicit MTU value (≤1442)
+        mtu: Not settable on a router; only used to trigger an explanatory
+             rejection. Set the MTU on the network instead.
         gateway_ip: Optional custom gateway IP
         subnet_id: Subnet ID for interface management
 
@@ -169,6 +176,34 @@ async def set_routers(
         kwargs['admin_state_up'] = admin_state_up
         kwargs['ha'] = ha
         kwargs['distributed'] = distributed
+        kwargs['enable_snat'] = enable_snat
+        if routes.strip():
+            # Accept JSON list or comma-separated "dest/nexthop" pairs
+            raw = routes.strip()
+            if raw.startswith('['):
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError as e:
+                    return f"Error: routes is not valid JSON: {e}"
+            else:
+                parsed = []
+                for item in raw.split(','):
+                    item = item.strip()
+                    if not item:
+                        continue
+                    if '/' not in item:
+                        return f"Error: route '{item}' must be in DESTINATION/NEXTHOP form"
+                    destination, nexthop = item.split('/', 1)
+                    parsed.append({'destination': destination.strip(),
+                                   'nexthop': nexthop.strip()})
+            if not parsed:
+                return "Error: routes must be a non-empty list"
+            kwargs['routes'] = parsed
+        # NOTE: deliberately do NOT inject an empty external_network_id here.
+        # The service reads an explicitly empty value as "detach the gateway",
+        # so injecting it on every set/update would silently strip the gateway
+        # from any router that was merely being renamed. Callers that genuinely
+        # want a detach should use the remove_gateway action.
 
         # Handle single router (backward compatibility)
         if len(name_list) == 1:

@@ -238,13 +238,14 @@ New consolidated `get_instance` tool replaces multiple separate tools:
 | `openstack floating ip port forwarding set` | `set_floating_ip_port_forwarding` (action="set") | ✅ | Port forwarding updates |
 | `openstack floating ip port forwarding show` | `set_floating_ip_port_forwarding` (action="show") | ✅ | Port forwarding details |
 | `openstack security group list` | `get_security_groups` | ✅ | Security group listing |
-| `openstack security group create/delete` | (Not yet implemented) | 🚧 | Security group management |
+| `openstack security group create/delete/set` | `set_security_groups` | ✅ | Security group management |
+| `openstack security group rule create/delete` | `set_security_groups` (action="create_rule"/"delete_rule") | ✅ | Security group rule management |
 | `openstack port list` | `get_network_details` (includes ports) | ✅ | Port information included |
 | `openstack port create/delete` | `set_network_ports` | ✅ | Port management |
-| `openstack network qos policy list` | (Not yet implemented) | 🚧 | QoS policy listing |
-| `openstack network qos policy create` | `set_network_qos_policies` | ✅ | QoS policy management |
-| `openstack network agent list` | `get_service_status` (includes agents) | ✅ | Network agents |
-| `openstack network agent set` | `set_network_agents` | ✅ | Network agent management |
+| `openstack network qos policy list` | `set_network_qos_policies` | ✅ | QoS policy listing |
+| `openstack network qos policy create/delete/set` | `set_network_qos_policies` | ✅ | QoS policy management |
+| `openstack network agent list` | `set_network_agents` (action="list") | ✅ | Network agents |
+| `openstack network agent set` | `set_network_agents` | ✅ | Admin state, DHCP network hosting, L3 router binding |
 
 ### 3. 💾 **Storage (Cinder)**
 
