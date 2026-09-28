@@ -925,6 +925,7 @@ from .services.compute import (
 from .services.network import (
     get_network_details,
     get_security_groups,
+    set_security_groups,
     get_floating_ips,
     get_floating_ip_pools,
     set_floating_ip,
@@ -933,6 +934,8 @@ from .services.network import (
     set_routers,
     set_networks,
     set_network_ports,
+    set_network_agents,
+    set_network_qos_policies,
     set_subnets
 )
 
@@ -1032,32 +1035,14 @@ from .services.load_balancer import (
 
 
 # =============================================================================
-# ADDITIONAL UTILITY FUNCTIONS (TEMPORARY IMPLEMENTATIONS)
+# NETWORK AGENTS / QOS POLICIES
 # =============================================================================
-
-def set_network_qos_policies(action: str, policy_name: str = None, **kwargs) -> Dict[str, Any]:
-    """
-    Temporary implementation for network QoS policies management
-    TODO: Implement full functionality in network.py
-    """
-    return {
-        "error": "Network QoS policies management not yet implemented in modular structure",
-        "success": False,
-        "action": action,
-        "policy_name": policy_name
-    }
-
-def set_network_agents(action: str, agent_id: str = None, **kwargs) -> Dict[str, Any]:
-    """
-    Temporary implementation for network agents management
-    TODO: Implement full functionality in network.py
-    """
-    return {
-        "error": "Network agents management not yet implemented in modular structure", 
-        "success": False,
-        "action": action,
-        "agent_id": agent_id
-    }
+# set_network_agents and set_network_qos_policies were hardcoded TODO stubs that
+# always returned "not yet implemented in modular structure" regardless of the
+# requested action, while their tools advertised working list/enable/disable and
+# list/create/delete actions. They are now implemented in services/network.py and
+# re-exported via the `from .services.network import (...)` block above.
+# =============================================================================
 
 
 # =============================================================================

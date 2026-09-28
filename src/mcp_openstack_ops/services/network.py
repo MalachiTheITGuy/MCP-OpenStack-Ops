@@ -147,7 +147,10 @@ def set_networks(action: str, network_name: Optional[str] = None, **kwargs) -> D
     """
     try:
         # Import here to avoid circular imports
-        from ..connection import get_openstack_connection
+        from ..connection import (
+            find_resource_by_name_or_id,
+            get_openstack_connection,
+        )
         conn = get_openstack_connection()
         
         if action.lower() == 'create':
@@ -227,12 +230,11 @@ def set_networks(action: str, network_name: Optional[str] = None, **kwargs) -> D
                     'message': 'Network name or ID is required for update action'
                 }
             
-            # Find the network
-            network = None
-            for net in conn.network.networks():
-                if getattr(net, 'name', '') == network_name or net.id == network_name:
-                    network = net
-                    break
+            # Use the project-scoped helper so update cannot reach outside the
+            # current project, matching this function's own delete branch.
+            network = find_resource_by_name_or_id(
+                conn.network.networks(), network_name, 'network'
+            )
             
             if not network:
                 return {
@@ -250,6 +252,16 @@ def set_networks(action: str, network_name: Optional[str] = None, **kwargs) -> D
                 update_params['is_shared'] = kwargs['shared']
             if kwargs.get('mtu'):
                 update_params['mtu'] = kwargs['mtu']
+            # These were unreachable: a network could not be renamed, and its
+            # QoS policy, port-security setting or DNS domain could never change.
+            if kwargs.get('name'):
+                update_params['name'] = kwargs['name']
+            if kwargs.get('qos_policy_id') is not None:
+                update_params['qos_policy_id'] = kwargs['qos_policy_id'] or None
+            if kwargs.get('port_security_enabled') is not None:
+                update_params['is_port_security_enabled'] = kwargs['port_security_enabled']
+            if kwargs.get('dns_domain') is not None:
+                update_params['dns_domain'] = kwargs['dns_domain']
             
             if update_params:
                 updated_network = conn.network.update_network(network, **update_params)
@@ -421,27 +433,49 @@ def set_floating_ip(action: str, **kwargs) -> Dict[str, Any]:
             }
             
         elif action.lower() == 'allocate':
-            network_name = kwargs.get('network', kwargs.get('network_name'))
+            # The public tool forwards `floating_network_id`; older callers pass
+            # `network`/`network_name`. Previously only the latter two were read,
+            # so `set_floating_ip(action="allocate", ...)` was unreachable
+            # end-to-end through the tool.
+            network_ref = (
+                kwargs.get('floating_network_id')
+                or kwargs.get('network')
+                or kwargs.get('network_name')
+                or kwargs.get('external_network_id')
+            )
             subnet_id = kwargs.get('subnet_id')
+            description = kwargs.get('description')
             
-            if not network_name:
+            if not network_ref:
                 return {
                     'success': False,
-                    'message': 'network parameter is required for allocate action'
+                    'message': 'floating_network_id (or network) is required for allocate action'
                 }
             
-            # Find the external network
+            # Find the external network by name or ID. The external check is
+            # only enforced when the attribute is actually present, because some
+            # deployments do not populate is_router_external on the resource.
             external_network = None
             for network in conn.network.networks():
-                if (getattr(network, 'name', '') == network_name or network.id == network_name) and \
-                   getattr(network, 'is_router_external', False):
-                    external_network = network
-                    break
+                if getattr(network, 'name', '') == network_ref or network.id == network_ref:
+                    if getattr(network, 'is_router_external', True):
+                        external_network = network
+                        break
             
             if not external_network:
+                # Distinguish "no such network" from "exists but not external"
+                exists = any(
+                    getattr(n, 'name', '') == network_ref or n.id == network_ref
+                    for n in conn.network.networks()
+                )
+                if exists:
+                    return {
+                        'success': False,
+                        'message': f'Network "{network_ref}" is not an external (router) network'
+                    }
                 return {
                     'success': False,
-                    'message': f'External network "{network_name}" not found'
+                    'message': f'External network "{network_ref}" not found'
                 }
             
             create_params = {
@@ -1086,6 +1120,9 @@ def get_routers() -> List[Dict[str, Any]]:
                     'description': getattr(router, 'description', ''),
                     'ha': getattr(router, 'is_ha', False),
                     'distributed': getattr(router, 'is_distributed', False),
+                    # Static routes were never surfaced, so the routing table
+                    # was invisible even though the SDK exposes it.
+                    'routes': getattr(router, 'routes', []),
                     'interfaces': interfaces,
                     'interface_count': len(interfaces)
                 })
@@ -1139,10 +1176,18 @@ def set_routers(action: str, router_name: Optional[str] = None, **kwargs) -> Dic
             if 'distributed' in kwargs:
                 create_params['distributed'] = kwargs['distributed']
             if kwargs.get('mtu'):
-                create_params['mtu'] = int(kwargs['mtu'])
+                return {
+                    'success': False,
+                    'message': 'mtu is not settable on a router; set it on the '
+                               'network instead (the network MTU must already be '
+                               'low enough to fit the router)'
+                }
             external_network_id = kwargs.get('external_network_id')
             if external_network_id:
-                create_params['external_gateway_info'] = {'network_id': external_network_id, 'enable_snat': True}
+                create_params['external_gateway_info'] = {
+                    'network_id': external_network_id,
+                    'enable_snat': kwargs.get('enable_snat', True),
+                }
                 if 'gateway_ip' in kwargs:
                     create_params['external_gateway_info']['external_fixed_ips'] = [{'subnet_id': kwargs.get('subnet_id', ''), 'ip_address': kwargs['gateway_ip']}]
             router = conn.network.create_router(**create_params)
@@ -1166,13 +1211,86 @@ def set_routers(action: str, router_name: Optional[str] = None, **kwargs) -> Dic
             if 'distributed' in kwargs:
                 update_params['distributed'] = kwargs['distributed']
             if kwargs.get('mtu'):
-                update_params['mtu'] = int(kwargs['mtu'])
+                return {
+                    'success': False,
+                    'message': 'mtu is not settable on a router; set it on the '
+                               'network instead (the network MTU must already be '
+                               'low enough to fit the router)'
+                }
             if 'external_network_id' in kwargs:
-                update_params['external_gateway_info'] = {'network_id': kwargs['external_network_id'], 'enable_snat': True}
-                if 'gateway_ip' in kwargs:
-                    update_params['external_gateway_info']['external_fixed_ips'] = [{'subnet_id': kwargs.get('subnet_id', ''), 'ip_address': kwargs['gateway_ip']}]
+                if not kwargs['external_network_id']:
+                    # Neutron expresses 'no external gateway' as an empty object.
+                    # Only a truthy value used to write this key, so detaching a
+                    # gateway was impossible.
+                    update_params['external_gateway_info'] = {}
+                else:
+                    update_params['external_gateway_info'] = {
+                        'network_id': kwargs['external_network_id'],
+                        'enable_snat': kwargs.get('enable_snat', True),
+                    }
+                    if 'gateway_ip' in kwargs and kwargs['gateway_ip']:
+                        update_params['external_gateway_info']['external_fixed_ips'] = [{
+                            'subnet_id': kwargs.get('subnet_id', ''),
+                            'ip_address': kwargs['gateway_ip'],
+                        }]
             router = conn.network.update_router(router, **update_params)
             return {'success': True, 'router': {'id': router.id, 'name': router.name, 'status': router.status}, 'message': f'Router {router_name} updated'}
+
+        if action.lower() in ('add_routes', 'remove_routes'):
+            if not router_name:
+                return {'success': False, 'message': f'router_name is required for {action} action'}
+            router = find_resource_by_name_or_id(conn.network.routers(), router_name, "Router")
+            if not router:
+                return {'success': False, 'message': f'Router "{router_name}" not found or not accessible in current project'}
+            # routes arrive as a list of {destination, nexthop} dicts
+            routes = kwargs.get('routes') or []
+            if not routes:
+                return {'success': False, 'message': 'routes is required and must be a non-empty list'}
+            route_body = {'routes': list(routes)}
+            if action.lower() == 'add_routes':
+                conn.network.add_extra_routes_to_router(router, route_body)
+            else:
+                conn.network.remove_extra_routes_from_router(router, route_body)
+            updated = conn.network.update_router(router)
+            verb = 'added to' if action.lower() == 'add_routes' else 'removed from'
+            return {
+                'success': True,
+                'router': {
+                    'id': updated.id,
+                    'name': updated.name,
+                    'routes': getattr(updated, 'routes', []),
+                },
+                'message': f'{len(routes)} route(s) {verb} router {router_name}',
+            }
+
+        if action.lower() in ('add_gateway', 'remove_gateway'):
+            if not router_name:
+                return {'success': False, 'message': f'router_name is required for {action} action'}
+            router = find_resource_by_name_or_id(conn.network.routers(), router_name, "Router")
+            if not router:
+                return {'success': False, 'message': f'Router "{router_name}" not found or not accessible in current project'}
+            if action.lower() == 'remove_gateway':
+                conn.network.remove_gateway_from_router(router, external_gateway_info={})
+                return {
+                    'success': True,
+                    'router': {'id': router.id, 'name': router.name},
+                    'message': f'External gateway removed from router {router_name}',
+                }
+            ext_net = kwargs.get('external_network_id') or kwargs.get('external_network')
+            if not ext_net:
+                return {'success': False, 'message': 'external_network_id is required for add_gateway action'}
+            gateway_info = {'network_id': ext_net, 'enable_snat': kwargs.get('enable_snat', True)}
+            if kwargs.get('gateway_ip'):
+                gateway_info['external_fixed_ips'] = [{
+                    'subnet_id': kwargs.get('subnet_id', ''),
+                    'ip_address': kwargs['gateway_ip'],
+                }]
+            conn.network.add_gateway_to_router(router, external_gateway_info=gateway_info)
+            return {
+                'success': True,
+                'router': {'id': router.id, 'name': router.name},
+                'message': f'External gateway {ext_net} added to router {router_name}',
+            }
 
         if action.lower() == 'delete':
             if not router_name:
@@ -1530,3 +1648,699 @@ def set_subnets(action: str, subnet_name: Optional[str] = None, **kwargs) -> Dic
             'message': f'Failed to manage subnet: {str(e)}',
             'error': str(e)
         }
+
+def set_network_qos_policies(action: str, policy_name: str = None, **kwargs) -> Dict[str, Any]:
+    """Manage Neutron QoS policies and the rules attached to them.
+
+    Replaces a stub that returned `{'success': False}` for every action.
+    """
+    from ..connection import (
+        find_resource_by_name_or_id,
+        get_openstack_connection,
+    )
+    conn = get_openstack_connection()
+
+    if action.lower() == 'list':
+        policies = []
+        for policy in conn.network.qos_policies():
+            policies.append({
+                'id': policy.id,
+                'name': policy.name,
+                'description': getattr(policy, 'description', None),
+                'shared': getattr(policy, 'is_shared', False),
+                'project_id': getattr(policy, 'project_id', None),
+                'rules': [rule_type for rule_type in (
+                    getattr(policy, 'rules', None) or [])],
+            })
+        return {
+            'success': True,
+            'policies': policies,
+            'message': f'Found {len(policies)} QoS polic(y/ies)',
+        }
+
+    if action.lower() == 'show':
+        if not policy_name:
+            return {'success': False, 'message': 'policy_name is required for show action'}
+        policy = find_resource_by_name_or_id(
+            conn.network.qos_policies(), policy_name, 'QoS policy')
+        if not policy:
+            return {
+                'success': False,
+                'message': f'QoS policy "{policy_name}" not found or not accessible in current project',
+            }
+        rules = []
+        for rule_type in (getattr(policy, 'rules', None) or []):
+            rules.extend(_collect_qos_rules(conn, policy, rule_type))
+        return {
+            'success': True,
+            'policy': {
+                'id': policy.id,
+                'name': policy.name,
+                'description': getattr(policy, 'description', None),
+                'shared': getattr(policy, 'is_shared', False),
+                'project_id': getattr(policy, 'project_id', None),
+                'rules': rules,
+            },
+            'message': f'QoS policy {policy.name} retrieved',
+        }
+
+    if action.lower() == 'create':
+        create_params = {'name': policy_name}
+        if not policy_name:
+            return {'success': False, 'message': 'policy_name is required for create action'}
+        if 'description' in kwargs:
+            create_params['description'] = kwargs['description']
+        if 'shared' in kwargs:
+            create_params['shared'] = kwargs['shared']
+        policy = conn.network.create_qos_policy(**create_params)
+        return {
+            'success': True,
+            'policy': {'id': policy.id, 'name': policy.name},
+            'message': f'QoS policy {policy.name} created',
+        }
+
+    if action.lower() == 'set':
+        if not policy_name:
+            return {'success': False, 'message': 'policy_name is required for set action'}
+        policy = find_resource_by_name_or_id(
+            conn.network.qos_policies(), policy_name, 'QoS policy')
+        if not policy:
+            return {
+                'success': False,
+                'message': f'QoS policy "{policy_name}" not found or not accessible in current project',
+            }
+        update_params = {}
+        new_name = kwargs.get('new_name') or kwargs.get('name')
+        if new_name:
+            update_params['name'] = new_name
+        if 'description' in kwargs:
+            update_params['description'] = kwargs['description']
+        if 'shared' in kwargs:
+            update_params['shared'] = kwargs['shared']
+        if not update_params:
+            return {
+                'success': False,
+                'message': 'No update parameters provided (new_name, description, shared)',
+            }
+        policy = conn.network.update_qos_policy(policy, **update_params)
+        return {
+            'success': True,
+            'policy': {'id': policy.id, 'name': policy.name},
+            'message': f'QoS policy {policy_name} updated',
+        }
+
+    if action.lower() == 'delete':
+        if not policy_name:
+            return {'success': False, 'message': 'policy_name is required for delete action'}
+        policy = find_resource_by_name_or_id(
+            conn.network.qos_policies(), policy_name, 'QoS policy')
+        if not policy:
+            return {
+                'success': False,
+                'message': f'QoS policy "{policy_name}" not found or not accessible in current project',
+            }
+        conn.network.delete_qos_policy(policy)
+        return {'success': True, 'message': f'QoS policy {policy_name} deleted'}
+
+    # ---- QoS rules ----
+    if action.lower() in ('create_rule', 'delete_rule', 'list_rules'):
+        return _handle_qos_rule_action(conn, action, policy_name, **kwargs)
+
+    return {
+        'success': False,
+        'message': f'Unknown action "{action}". Supported: list, show, create, set, '
+                   f'delete, create_rule, delete_rule, list_rules',
+    }
+
+
+def _collect_qos_rules(conn, policy, rule_type: str) -> list:
+    """Fetch the concrete rule objects for one entry of a policy's rule list."""
+    collectors = {
+        'bandwidth_limit': conn.network.qos_bandwidth_limit_rules,
+        'dscp_marking': conn.network.qos_dscp_marking_rules,
+        'minimum_bandwidth': conn.network.qos_minimum_bandwidth_rules,
+        'minimum_packet_rate': conn.network.qos_minimum_packet_rate_rules,
+        'packet_rate_limit': conn.network.qos_packet_rate_limit_rules,
+    }
+    collect = collectors.get(rule_type)
+    if collect is None:
+        return []
+    out = []
+    for rule in collect(policy):
+        entry = {
+            'id': rule.id,
+            'name': getattr(rule, 'name', None),
+            'type': rule_type,
+        }
+        for attr in ('max_kbps', 'max_burst_kbps', 'dscp_mark', 'min_kpps',
+                     'direction'):
+            if hasattr(rule, attr):
+                entry[attr] = getattr(rule, attr)
+        out.append(entry)
+    return out
+
+
+def _handle_qos_rule_action(conn, action: str, policy_name, **kwargs):
+    """Create / list / delete the individual rule types under a QoS policy."""
+    rule_type = kwargs.get('rule_type')
+    if not rule_type:
+        return {
+            'success': False,
+            'message': 'rule_type is required for this action. One of: bandwidth_limit, '
+                       'dscp_marking, minimum_bandwidth, minimum_packet_rate, '
+                       'packet_rate_limit',
+        }
+    if not policy_name:
+        return {'success': False, 'message': 'policy_name is required for this action'}
+
+    policy = find_resource_by_name_or_id(
+        conn.network.qos_policies(), policy_name, 'QoS policy')
+    if not policy:
+        return {
+            'success': False,
+            'message': f'QoS policy "{policy_name}" not found or not accessible in current project',
+        }
+
+    if action.lower() == 'list_rules':
+        return {
+            'success': True,
+            'rules': _collect_qos_rules(conn, policy, rule_type),
+            'message': f'Rules of type {rule_type} listed for policy {policy_name}',
+        }
+
+    if action.lower() == 'create_rule':
+        create_map = {
+            'bandwidth_limit': 'create_qos_bandwidth_limit_rule',
+            'dscp_marking': 'create_qos_dscp_marking_rule',
+            'minimum_bandwidth': 'create_qos_minimum_bandwidth_rule',
+            'minimum_packet_rate': 'create_qos_minimum_packet_rate_rule',
+            'packet_rate_limit': 'create_qos_packet_rate_limit_rule',
+        }
+        method = create_map.get(rule_type)
+        if not method:
+            return {'success': False, 'message': f'Unknown rule_type "{rule_type}"'}
+        rule_params = {
+            k: v for k, v in kwargs.items()
+            if k in ('name', 'direction', 'max_kbps', 'max_burst_kbps',
+                     'dscp_mark', 'min_kpps')
+        }
+        if not rule_params.get('name'):
+            return {'success': False, 'message': 'name is required for create_rule'}
+        rule = getattr(conn.network, method)(policy, **rule_params)
+        return {
+            'success': True,
+            'rule': {
+                'id': rule.id,
+                'name': getattr(rule, 'name', None),
+                'type': rule_type,
+            },
+            'message': f'{rule_type} rule {rule_params["name"]} created on policy {policy_name}',
+        }
+
+    if action.lower() == 'delete_rule':
+        rule_name = kwargs.get('rule_name') or kwargs.get('name')
+        if not rule_name:
+            return {'success': False, 'message': 'rule_name is required for delete_rule'}
+        find_map = {
+            'bandwidth_limit': 'find_qos_bandwidth_limit_rule',
+            'dscp_marking': 'find_qos_dscp_marking_rule',
+            'minimum_bandwidth': 'find_qos_minimum_bandwidth_rule',
+            'minimum_packet_rate': 'find_qos_minimum_packet_rate_rule',
+            'packet_rate_limit': 'find_qos_packet_rate_limit_rule',
+        }
+        delete_map = {
+            'bandwidth_limit': 'delete_qos_bandwidth_limit_rule',
+            'dscp_marking': 'delete_qos_dscp_marking_rule',
+            'minimum_bandwidth': 'delete_qos_minimum_bandwidth_rule',
+            'minimum_packet_rate': 'delete_qos_minimum_packet_rate_rule',
+            'packet_rate_limit': 'delete_qos_packet_rate_limit_rule',
+        }
+        rule = getattr(conn.network, find_map[rule_type])(
+            rule_name, ignore_missing=False, qos_policy=policy)
+        if not rule:
+            return {
+                'success': False,
+                'message': f'{rule_type} rule "{rule_name}" not found on policy {policy_name}',
+            }
+        getattr(conn.network, delete_map[rule_type])(rule, policy)
+        return {
+            'success': True,
+            'message': f'{rule_type} rule {rule_name} deleted from policy {policy_name}',
+        }
+
+    return {'success': False, 'message': f'Unknown action "{action}"'}
+
+
+def set_network_agents(action: str, agent_id: str = None, **kwargs) -> Dict[str, Any]:
+    """Manage Neutron agents and their network/router bindings.
+
+    Replaces a stub that returned `{'success': False}` for every action.
+    """
+    from ..connection import (
+        find_resource_by_name_or_id,
+        get_openstack_connection,
+    )
+    conn = get_openstack_connection()
+
+    if action.lower() == 'list':
+        agents = []
+        for agent in conn.network.agents():
+            agents.append({
+                'id': agent.id,
+                'name': getattr(agent, 'name', None),
+                # Neutron's "agent_type" body field is exposed as .agent_type;
+                # 'binary' is the legacy alias and is absent in 4.20.0.
+                'agent_type': getattr(agent, 'agent_type', None),
+                'host': getattr(agent, 'host', None),
+                'admin_state_up': getattr(agent, 'is_admin_state_up', None),
+                'alive': getattr(agent, 'is_alive', None),
+                # The wire field is `resources`; the SDK attribute is
+                # .resources_synced. There is no .resources attribute.
+                'resources_synced': getattr(agent, 'resources_synced', None),
+            })
+        return {
+            'success': True,
+            'agents': agents,
+            'message': f'Found {len(agents)} agent(s)',
+        }
+
+    if action.lower() == 'show':
+        if not agent_id:
+            return {'success': False, 'message': 'agent_id is required for show action'}
+        agent = _find_agent(conn, agent_id)
+        if not agent:
+            return {
+                'success': False,
+                'message': f'Agent "{agent_id}" not found',
+            }
+        return {
+            'success': True,
+            'agent': {
+                'id': agent.id,
+                'name': getattr(agent, 'name', None),
+                'agent_type': getattr(agent, 'agent_type', None),
+                'host': getattr(agent, 'host', None),
+                'admin_state_up': getattr(agent, 'is_admin_state_up', None),
+                'alive': getattr(agent, 'is_alive', None),
+                'resources_synced': getattr(agent, 'resources_synced', None),
+            },
+            'message': f'Agent {agent_id} retrieved',
+        }
+
+    if action.lower() == 'set':
+        if not agent_id:
+            return {'success': False, 'message': 'agent_id is required for set action'}
+        agent = _find_agent(conn, agent_id)
+        if not agent:
+            return {
+                'success': False,
+                'message': f'Agent "{agent_id}" not found',
+            }
+        update_params = {}
+        # The wire field is `admin_state_up`; the SDK attribute is
+        # .is_admin_state_up. Passing `admin` here would be silently dropped.
+        if 'admin_state_up' in kwargs:
+            update_params['admin_state_up'] = kwargs['admin_state_up']
+        if 'description' in kwargs:
+            update_params['description'] = kwargs['description']
+        if not update_params:
+            return {
+                'success': False,
+                'message': 'No update parameters provided (admin_state_up, description)',
+            }
+        agent = conn.network.update_agent(agent, **update_params)
+        return {
+            'success': True,
+            'agent': {
+                'id': agent.id,
+                'name': getattr(agent, 'name', None),
+                'admin_state_up': getattr(agent, 'is_admin_state_up', None),
+            },
+            'message': f'Agent {agent_id} updated',
+        }
+
+    if action.lower() == 'delete':
+        if not agent_id:
+            return {'success': False, 'message': 'agent_id is required for delete action'}
+        agent = _find_agent(conn, agent_id)
+        if not agent:
+            return {
+                'success': False,
+                'message': f'Agent "{agent_id}" not found',
+            }
+        conn.network.delete_agent(agent)
+        return {'success': True, 'message': f'Agent {agent_id} deleted'}
+
+    if action.lower() in ('list_dhcp_networks', 'list_agent_networks'):
+        if not agent_id:
+            return {'success': False, 'message': 'agent_id is required for this action'}
+        agent = _find_agent(conn, agent_id)
+        if not agent:
+            return {'success': False, 'message': f'Agent "{agent_id}" not found'}
+        networks = []
+        for entry in conn.network.dhcp_agent_hosting_networks(agent):
+            net = getattr(entry, 'network', None)
+            if net is None and isinstance(entry, dict):
+                net = entry.get('network')
+            networks.append({
+                'id': getattr(net, 'id', None) if net is not None else None,
+                'name': getattr(net, 'name', None) if net is not None else None,
+            })
+        return {
+            'success': True,
+            'networks': networks,
+            'message': f'Networks hosted by DHCP agent {agent_id}',
+        }
+
+    # ---- network / router bindings ----
+    if action.lower() in ('add_dhcp_to_network', 'remove_dhcp_from_network'):
+        network_ref = kwargs.get('network_id') or kwargs.get('network_name') or kwargs.get('network')
+        if not agent_id or not network_ref:
+            return {
+                'success': False,
+                'message': 'agent_id and network_id are required for this action',
+            }
+        agent = _find_agent(conn, agent_id)
+        if not agent:
+            return {'success': False, 'message': f'Agent "{agent_id}" not found'}
+        network = find_resource_by_name_or_id(
+            conn.network.networks(), network_ref, 'network')
+        if not network:
+            return {
+                'success': False,
+                'message': f'Network "{network_ref}" not found or not accessible in current project',
+            }
+        if action.lower() == 'add_dhcp_to_network':
+            conn.network.add_dhcp_agent_to_network(agent, network)
+            verb = 'added to'
+        else:
+            conn.network.remove_dhcp_agent_from_network(agent, network)
+            verb = 'removed from'
+        return {
+            'success': True,
+            'message': f'DHCP agent {agent_id} {verb} network {network_ref}',
+        }
+
+    if action.lower() in ('add_router_to_agent', 'remove_router_from_agent',
+                           'list_agent_routers'):
+        router_ref = kwargs.get('router_id') or kwargs.get('router_name') or kwargs.get('router')
+        if not agent_id:
+            return {'success': False, 'message': 'agent_id is required for this action'}
+        agent = _find_agent(conn, agent_id)
+        if not agent:
+            return {'success': False, 'message': f'Agent "{agent_id}" not found'}
+
+        if action.lower() == 'list_agent_routers':
+            routers = []
+            for entry in conn.network.agent_hosted_routers(agent):
+                router_info = getattr(entry, 'router', None)
+                routers.append({
+                    'id': getattr(router_info, 'id', None),
+                    'name': getattr(router_info, 'name', None),
+                    'ha_chassis_priority': getattr(entry, 'ha_chassis_priority', None),
+                })
+            return {
+                'success': True,
+                'routers': routers,
+                'message': f'Routers hosted by agent {agent_id}',
+            }
+
+        if not router_ref:
+            return {
+                'success': False,
+                'message': 'router_id is required for this action',
+            }
+        router = find_resource_by_name_or_id(
+            conn.network.routers(), router_ref, 'Router')
+        if not router:
+            return {
+                'success': False,
+                'message': f'Router "{router_ref}" not found or not accessible in current project',
+            }
+        if action.lower() == 'add_router_to_agent':
+            conn.network.add_router_to_agent(agent, router)
+            verb = 'added to'
+        else:
+            conn.network.remove_router_from_agent(agent, router)
+            verb = 'removed from'
+        return {
+            'success': True,
+            'message': f'L3 agent {agent_id} {verb} router {router_ref}',
+        }
+
+    return {
+        'success': False,
+        'message': f'Unknown action "{action}". Supported: list, show, set, delete, '
+                   f'list_dhcp_networks, add_dhcp_to_network, remove_dhcp_from_network, '
+                   f'add_router_to_agent, remove_router_from_agent, list_agent_routers',
+    }
+
+
+def _find_agent(conn, agent_ref: str):
+    """Resolve an agent by ID or by host. Agent has no usable name field."""
+    for agent in conn.network.agents():
+        if agent.id == agent_ref:
+            return agent
+    for agent in conn.network.agents():
+        if getattr(agent, 'host', None) == agent_ref:
+            return agent
+    return None
+
+
+def set_security_groups(action: str, security_group_name: str = None, **kwargs) -> Dict[str, Any]:
+    """Manage security groups and their rules.
+
+    Previously only read-only listing existed (get_security_groups), so rules
+    could never be created or removed through this server.
+
+    Note: Neutron security group rules are immutable (the SDK resource sets
+    allow_commit = False and the proxy has no update_security_group_rule), so
+    there is deliberately no `update_rule` action. Changing a rule means
+    delete_rule followed by create_rule.
+    """
+    from ..connection import (
+        find_resource_by_name_or_id,
+        get_openstack_connection,
+    )
+    conn = get_openstack_connection()
+
+    if action.lower() == 'list':
+        groups = []
+        for group in conn.network.security_groups():
+            groups.append({
+                'id': group.id,
+                'name': group.name,
+                'description': getattr(group, 'description', None),
+                'stateful': getattr(group, 'stateful', None),
+                'shared': getattr(group, 'is_shared', False),
+                'project_id': getattr(group, 'project_id', None),
+                'rule_count': len(getattr(group, 'security_group_rules', []) or []),
+            })
+        return {
+            'success': True,
+            'security_groups': groups,
+            'message': f'Found {len(groups)} security group(s)',
+        }
+
+    if action.lower() == 'show':
+        if not security_group_name:
+            return {'success': False, 'message': 'security_group_name is required for show action'}
+        group = find_resource_by_name_or_id(
+            conn.network.security_groups(), security_group_name, 'Security group')
+        if not group:
+            return {
+                'success': False,
+                'message': f'Security group "{security_group_name}" not found or not accessible in current project',
+            }
+        rules = []
+        for rule in (getattr(group, 'security_group_rules', None) or []):
+            rules.append(_format_sg_rule(rule))
+        return {
+            'success': True,
+            'security_group': {
+                'id': group.id,
+                'name': group.name,
+                'description': getattr(group, 'description', None),
+                'stateful': getattr(group, 'stateful', None),
+                'shared': getattr(group, 'is_shared', False),
+                'project_id': getattr(group, 'project_id', None),
+                'rules': rules,
+            },
+            'message': f'Security group {group.name} retrieved',
+        }
+
+    if action.lower() == 'list_rules':
+        if not security_group_name:
+            return {'success': False, 'message': 'security_group_name is required for list_rules'}
+        group = find_resource_by_name_or_id(
+            conn.network.security_groups(), security_group_name, 'Security group')
+        if not group:
+            return {
+                'success': False,
+                'message': f'Security group "{security_group_name}" not found or not accessible in current project',
+            }
+        rules = [_format_sg_rule(r) for r in (conn.network.security_group_rules(security_group_id=group.id))]
+        return {
+            'success': True,
+            'rules': rules,
+            'message': f'Found {len(rules)} rule(s) in security group {group.name}',
+        }
+
+    if action.lower() == 'create':
+        if not security_group_name:
+            return {'success': False, 'message': 'security_group_name is required for create action'}
+        create_params = {'name': security_group_name}
+        if 'description' in kwargs:
+            create_params['description'] = kwargs['description']
+        if 'stateful' in kwargs:
+            create_params['stateful'] = kwargs['stateful']
+        group = conn.network.create_security_group(**create_params)
+        return {
+            'success': True,
+            'security_group': {'id': group.id, 'name': group.name},
+            'message': f'Security group {group.name} created',
+        }
+
+    if action.lower() == 'set':
+        if not security_group_name:
+            return {'success': False, 'message': 'security_group_name is required for set action'}
+        group = find_resource_by_name_or_id(
+            conn.network.security_groups(), security_group_name, 'Security group')
+        if not group:
+            return {
+                'success': False,
+                'message': f'Security group "{security_group_name}" not found or not accessible in current project',
+            }
+        update_params = {}
+        new_name = kwargs.get('new_name') or kwargs.get('name')
+        if new_name:
+            update_params['name'] = new_name
+        if 'description' in kwargs:
+            update_params['description'] = kwargs['description']
+        if not update_params:
+            return {
+                'success': False,
+                'message': 'No update parameters provided (new_name, description)',
+            }
+        group = conn.network.update_security_group(group, **update_params)
+        return {
+            'success': True,
+            'security_group': {'id': group.id, 'name': group.name},
+            'message': f'Security group {security_group_name} updated',
+        }
+
+    if action.lower() == 'delete':
+        if not security_group_name:
+            return {'success': False, 'message': 'security_group_name is required for delete action'}
+        group = find_resource_by_name_or_id(
+            conn.network.security_groups(), security_group_name, 'Security group')
+        if not group:
+            return {
+                'success': False,
+                'message': f'Security group "{security_group_name}" not found or not accessible in current project',
+            }
+        conn.network.delete_security_group(group)
+        return {'success': True, 'message': f'Security group {security_group_name} deleted'}
+
+    if action.lower() == 'create_rule':
+        if not security_group_name:
+            return {'success': False, 'message': 'security_group_name is required for create_rule'}
+        group = find_resource_by_name_or_id(
+            conn.network.security_groups(), security_group_name, 'Security group')
+        if not group:
+            return {
+                'success': False,
+                'message': f'Security group "{security_group_name}" not found or not accessible in current project',
+            }
+        direction = kwargs.get('direction')
+        if not direction:
+            return {
+                'success': False,
+                'message': 'direction is required for create_rule (ingress or egress)',
+            }
+        if direction not in ('ingress', 'egress'):
+            # Neutron would reject this, but with an opaque 400. Catch it here
+            # so the caller learns the allowed values.
+            return {
+                'success': False,
+                'message': f'Invalid direction "{direction}"; must be ingress or egress',
+            }
+        rule_params = {
+            'security_group_id': group.id,
+            'direction': direction,
+        }
+        optional = ('description', 'ether_type', 'port_range_min',
+                    'port_range_max', 'protocol', 'remote_ip_prefix',
+                    'remote_group_id')
+        for key in optional:
+            if kwargs.get(key) is not None:
+                rule_params[key] = kwargs[key]
+        if not rule_params.get('protocol'):
+            return {'success': False, 'message': 'protocol is required for create_rule'}
+        if not (rule_params.get('port_range_min') is not None
+                and rule_params.get('port_range_max') is not None):
+            return {
+                'success': False,
+                'message': 'port_range_min and port_range_max are both required for create_rule',
+            }
+        if rule_params['port_range_min'] > rule_params['port_range_max']:
+            return {
+                'success': False,
+                'message': f'Invalid port range: port_range_min '
+                           f'({rule_params["port_range_min"]}) must not exceed '
+                           f'port_range_max ({rule_params["port_range_max"]})',
+            }
+        rule = conn.network.create_security_group_rule(**rule_params)
+        return {
+            'success': True,
+            'rule': _format_sg_rule(rule),
+            'message': f'{rule_params["direction"]} rule created in security group {group.name}',
+        }
+
+    if action.lower() == 'delete_rule':
+        rule_ref = kwargs.get('rule_id') or kwargs.get('rule_name')
+        if not rule_ref:
+            return {'success': False, 'message': 'rule_id is required for delete_rule'}
+        rule = find_resource_by_name_or_id(
+            conn.network.security_group_rules(), rule_ref, 'Security group rule')
+        if not rule:
+            return {
+                'success': False,
+                'message': f'Security group rule "{rule_ref}" not found or not accessible in current project',
+            }
+        conn.network.delete_security_group_rule(rule)
+        return {
+            'success': True,
+            'message': f'Security group rule {rule_ref} deleted',
+        }
+
+    return {
+        'success': False,
+        'message': f'Unknown action "{action}". Supported: list, show, list_rules, '
+                   f'create, set, delete, create_rule, delete_rule',
+    }
+
+
+def _format_sg_rule(rule) -> Dict[str, Any]:
+    """Render a SecurityGroupRule, tolerating the list-summary dict form."""
+    if isinstance(rule, dict):
+        return {
+            'id': rule.get('id'),
+            'direction': rule.get('direction'),
+            'ether_type': rule.get('ether_type'),
+            'protocol': rule.get('protocol'),
+            'port_range_min': rule.get('port_range_min'),
+            'port_range_max': rule.get('port_range_max'),
+            'remote_ip_prefix': rule.get('remote_ip_prefix'),
+            'description': rule.get('description'),
+        }
+    return {
+        'id': getattr(rule, 'id', None),
+        'direction': getattr(rule, 'direction', None),
+        'ether_type': getattr(rule, 'ether_type', None),
+        'protocol': getattr(rule, 'protocol', None),
+        'port_range_min': getattr(rule, 'port_range_min', None),
+        'port_range_max': getattr(rule, 'port_range_max', None),
+        'remote_ip_prefix': getattr(rule, 'remote_ip_prefix', None),
+        'description': getattr(rule, 'description', None),
+    }
