@@ -1115,7 +1115,7 @@ def set_routers(action: str, router_name: Optional[str] = None, **kwargs) -> Dic
         Result of the router operation
     """
     try:
-        from ..connection import get_openstack_connection
+        from ..connection import get_openstack_connection, find_resource_by_name_or_id
         conn = get_openstack_connection()
 
         if action.lower() == 'list':
@@ -1147,7 +1147,11 @@ def set_routers(action: str, router_name: Optional[str] = None, **kwargs) -> Dic
             return {'success': True, 'router': {'id': router.id, 'name': router.name, 'status': router.status}, 'message': f'Router {router.name} created'}
 
         if action.lower() == 'set':
+            if not router_name:
+                return {'success': False, 'message': 'router_name is required for set action'}
             router = find_resource_by_name_or_id(conn.network.routers(), router_name, "Router")
+            if not router:
+                return {'success': False, 'message': f'Router "{router_name}" not found or not accessible in current project'}
             update_params = {}
             if 'name' in kwargs:
                 update_params['name'] = kwargs['name']
@@ -1167,23 +1171,35 @@ def set_routers(action: str, router_name: Optional[str] = None, **kwargs) -> Dic
             return {'success': True, 'router': {'id': router.id, 'name': router.name, 'status': router.status}, 'message': f'Router {router_name} updated'}
 
         if action.lower() == 'delete':
+            if not router_name:
+                return {'success': False, 'message': 'router_name is required for delete action'}
             router = find_resource_by_name_or_id(conn.network.routers(), router_name, "Router")
+            if not router:
+                return {'success': False, 'message': f'Router "{router_name}" not found or not accessible in current project'}
             conn.network.delete_router(router)
             return {'success': True, 'message': f'Router {router_name} deleted'}
 
         if action.lower() == 'add_interface':
-            router = find_resource_by_name_or_id(conn.network.routers(), router_name, "Router")
+            if not router_name:
+                return {'success': False, 'message': 'router_name is required for add_interface action'}
             subnet_id = kwargs.get('subnet_id')
             if not subnet_id:
                 return {'success': False, 'message': 'subnet_id is required for add_interface'}
+            router = find_resource_by_name_or_id(conn.network.routers(), router_name, "Router")
+            if not router:
+                return {'success': False, 'message': f'Router "{router_name}" not found or not accessible in current project'}
             interface = conn.network.add_interface_to_router(router, subnet_id=subnet_id)
             return {'success': True, 'interface': {'id': interface.id, 'device_id': interface.device_id}, 'message': f'Interface added to router {router_name}'}
 
         if action.lower() == 'remove_interface':
-            router = find_resource_by_name_or_id(conn.network.routers(), router_name, "Router")
+            if not router_name:
+                return {'success': False, 'message': 'router_name is required for remove_interface action'}
             subnet_id = kwargs.get('subnet_id')
             if not subnet_id:
                 return {'success': False, 'message': 'subnet_id is required for remove_interface'}
+            router = find_resource_by_name_or_id(conn.network.routers(), router_name, "Router")
+            if not router:
+                return {'success': False, 'message': f'Router "{router_name}" not found or not accessible in current project'}
             conn.network.remove_interface_from_router(router, subnet_id=subnet_id)
             return {'success': True, 'message': f'Interface removed from router {router_name}'}
 
