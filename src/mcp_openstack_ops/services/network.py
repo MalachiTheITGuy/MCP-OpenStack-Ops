@@ -1138,6 +1138,8 @@ def set_routers(action: str, router_name: Optional[str] = None, **kwargs) -> Dic
                 create_params['ha'] = kwargs['ha']
             if 'distributed' in kwargs:
                 create_params['distributed'] = kwargs['distributed']
+            if kwargs.get('mtu'):
+                create_params['mtu'] = int(kwargs['mtu'])
             external_network_id = kwargs.get('external_network_id')
             if external_network_id:
                 create_params['external_gateway_info'] = {'network_id': external_network_id, 'enable_snat': True}
@@ -1163,6 +1165,8 @@ def set_routers(action: str, router_name: Optional[str] = None, **kwargs) -> Dic
                 update_params['ha'] = kwargs['ha']
             if 'distributed' in kwargs:
                 update_params['distributed'] = kwargs['distributed']
+            if kwargs.get('mtu'):
+                update_params['mtu'] = int(kwargs['mtu'])
             if 'external_network_id' in kwargs:
                 update_params['external_gateway_info'] = {'network_id': kwargs['external_network_id'], 'enable_snat': True}
                 if 'gateway_ip' in kwargs:
@@ -1189,7 +1193,15 @@ def set_routers(action: str, router_name: Optional[str] = None, **kwargs) -> Dic
             if not router:
                 return {'success': False, 'message': f'Router "{router_name}" not found or not accessible in current project'}
             interface = conn.network.add_interface_to_router(router, subnet_id=subnet_id)
-            return {'success': True, 'interface': {'id': interface.id, 'device_id': interface.device_id}, 'message': f'Interface added to router {router_name}'}
+            # add_interface_to_router returns the raw response body (a dict),
+            # not a resource object, so field access must be by key.
+            info = interface if isinstance(interface, dict) else interface.to_dict()
+            return {'success': True, 'interface': {
+                'id': info.get('port_id') or info.get('id'),
+                'subnet_id': info.get('subnet_id'),
+                'network_id': info.get('network_id'),
+                'device_id': info.get('device_id'),
+            }, 'message': f'Interface added to router {router_name}'}
 
         if action.lower() == 'remove_interface':
             if not router_name:
